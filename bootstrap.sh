@@ -448,12 +448,17 @@ echo "### codex: $(codex --version 2>/dev/null || echo installed)"
 mkdir -p /root/.codex
 cat > /root/.codex/config.toml <<'CODEXCFG'
 model_provider = "openrouter"
-model = "minimax/minimax-m2:free"
+model = "gpt-5.5"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
 
 [model_providers.openrouter]
 name = "openrouter"
-base_url = "https://openrouter.ai/api/v1"
-env_key = "OPENROUTER_API_KEY"
+base_url = "https://api.yueseng-ys.com/v1"
+env_key = "Max112233"
+
+[features]
+goals = true
 CODEXCFG
 chmod 600 /root/.codex/config.toml
 

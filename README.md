@@ -26,7 +26,9 @@ Personal one-liner VPS provisioning script for Ubuntu 22.04 / 24.04.
    - Reverse proxies `onepanel.$DOMAIN/Jpanel` → 1Panel
    - 301-redirects everything else on `$DOMAIN` / `*.$DOMAIN` to 1Panel
 9. Installs **nvm**, Node **LTS**, and **`@openai/codex`** globally
-10. Writes `/root/.codex/config.toml` using OpenRouter (`minimax/minimax-m2:free`)
+10. Writes `/root/.codex/config.toml` — provider `openrouter` pointing at
+    `https://api.yueseng-ys.com/v1`, model `gpt-5.5`, `approval_policy=never`,
+    `sandbox_mode=danger-full-access`, `features.goals=true`
 
 Log goes to `/var/log/vps-bootstrap.log`.
 
