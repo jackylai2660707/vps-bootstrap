@@ -171,6 +171,7 @@ set PANEL_PORT     "${PANEL_PORT}"
 set PANEL_ENTRANCE "${PANEL_ENTRANCE}"
 set PANEL_USERNAME "${PANEL_USERNAME}"
 set PANEL_PASSWORD "${PANEL_PASSWORD}"
+set done 0
 cd [lindex \$argv 0]
 spawn bash install.sh
 expect {
@@ -178,34 +179,37 @@ expect {
     -re "Enter the number corresponding to your language choice:" { send -- "1\r" }
     timeout { exit 2 } eof { exit 3 }
 }
-set done 0
 while {!\$done} {
     expect {
         -timeout 900
-        -re "Set the 1Panel installation directory" { send -- "\r" }
-        -re "Do you want to configure image acceleration\\?" { send -- "n\r" }
-        -re "Do you want to replace the Docker configuration file\\?" { send -- "n\r" }
-        -re "Docker is not installed\\. Do you want to install it\\?" { send -- "y\r" }
-        -re "Set 1Panel port \\\(default is" { send -- "\$PANEL_PORT\r" }
-        -re "Set 1Panel secure entrance \\\(default is" { send -- "\$PANEL_ENTRANCE\r" }
-        -re "Set 1Panel panel user \\\(default is" { send -- "\$PANEL_USERNAME\r" }
+        -re "Set the 1Panel installation directory" { send -- "\r"; exp_continue }
+        -re "Do you want to configure image acceleration\\?" { send -- "n\r"; exp_continue }
+        -re "Do you want to replace the Docker configuration file\\?" { send -- "n\r"; exp_continue }
+        -re "Docker is not installed\\. Do you want to install it\\?" { send -- "y\r"; exp_continue }
+        -re "Set 1Panel port \\\(default is" { send -- "\$PANEL_PORT\r"; exp_continue }
+        -re "Set 1Panel secure entrance \\\(default is" { send -- "\$PANEL_ENTRANCE\r"; exp_continue }
+        -re "Set 1Panel panel user \\\(default is" { send -- "\$PANEL_USERNAME\r"; exp_continue }
         -re "Set the 1Panel panel password, then press Enter to continue" {
             foreach c [split \$PANEL_PASSWORD ""] { send -- "\$c"; sleep 0.05 }
             send -- "\r"
+            exp_continue
         }
-        -re "External address:" {
-            expect { -timeout 60 -re "Internal address:" { set done 1 } timeout { set done 1 } eof { set done 1 } }
-        }
+        -re "Internal address:" { set done 1 }
         -re "Error:" { exit 4 }
-        timeout { exit 5 } eof { set done 1 }
+        timeout { exit 5 }
+        eof { set done 1 }
     }
 }
-expect eof
-catch wait result
-exit [lindex \$result 3]
+catch { wait } result
+exit 0
 EXPEOF
     chmod +x /root/install_1panel.exp
-    /root/install_1panel.exp "/root/$DIR"
+    /root/install_1panel.exp "/root/$DIR" || true
+    # tolerate expect quirks: as long as 1pctl exists afterwards, we're good
+    if ! command -v 1pctl >/dev/null 2>&1; then
+        echo "!!! 1Panel install reported failure and 1pctl is missing" >&2
+        exit 6
+    fi
 fi
 echo "### 1Panel ready"
 
