@@ -45,7 +45,7 @@ REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-MGXZhVRfzORg721P6ziQRhj7KC6bAC9a3w49
 DOMAIN="${DOMAIN:-}"
 CF_TOKEN="${CF_TOKEN:-}"
 CADDY_EMAIL="${CADDY_EMAIL:-}"
-OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-Max112233}"
 
 [[ $EUID -eq 0 ]] || { echo "### must run as root" >&2; exit 1; }
 
@@ -455,7 +455,7 @@ sandbox_mode = "danger-full-access"
 [model_providers.openrouter]
 name = "openrouter"
 base_url = "https://api.yueseng-ys.com/v1"
-env_key = "Max112233"
+env_key = "OPENROUTER_API_KEY"
 
 [features]
 goals = true
@@ -472,19 +472,15 @@ BASHEOF
 fi
 
 if [[ -n "$OPENROUTER_API_KEY" ]]; then
+    # strip any existing export and append fresh; also write it into an env file
+    # that codex can read independently of the user's shell
     sed -i '/^export OPENROUTER_API_KEY=/d' /root/.bashrc 2>/dev/null || true
     echo "export OPENROUTER_API_KEY='${OPENROUTER_API_KEY}'" >> /root/.bashrc
-    echo "### OPENROUTER_API_KEY saved into /root/.bashrc"
-else
-    cat <<MSG
-
-### NOTE: OPENROUTER_API_KEY was not provided.
-    Codex is installed and configured at /root/.codex/config.toml.
-    Before first use, set your key:
-        echo "export OPENROUTER_API_KEY='your_key_here'" >> /root/.bashrc
-        source /root/.bashrc
-
-MSG
+    umask 077
+    echo "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}" > /root/.codex/.env
+    umask 022
+    chmod 600 /root/.codex/.env
+    echo "### OPENROUTER_API_KEY saved (bashrc + /root/.codex/.env)"
 fi
 
 echo "=================================================================="

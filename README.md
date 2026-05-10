@@ -28,7 +28,9 @@ Personal one-liner VPS provisioning script for Ubuntu 22.04 / 24.04.
 9. Installs **nvm**, Node **LTS**, and **`@openai/codex`** globally
 10. Writes `/root/.codex/config.toml` — provider `openrouter` pointing at
     `https://api.yueseng-ys.com/v1`, model `gpt-5.5`, `approval_policy=never`,
-    `sandbox_mode=danger-full-access`, `features.goals=true`
+    `sandbox_mode=danger-full-access`, `features.goals=true`. Exports
+    `OPENROUTER_API_KEY` (default `Max112233`, override via env) into
+    `/root/.bashrc` and `/root/.codex/.env` so codex can read it.
 
 Log goes to `/var/log/vps-bootstrap.log`.
 
