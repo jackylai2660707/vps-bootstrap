@@ -424,15 +424,19 @@ if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
     echo "### installing nvm"
     curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/master/install.sh | PROFILE=/root/.bashrc bash
 fi
+# nvm's shell functions reference unset vars internally; temporarily relax -u
+set +u
 # shellcheck disable=SC1091
 . "$NVM_DIR/nvm.sh"
 
-if ! nvm ls --no-colors 2>/dev/null | grep -q 'lts/\*'; then
+# install Node LTS if no node is installed yet
+if [[ -z "$(nvm ls --no-colors 2>/dev/null | grep -E '^[[:space:]]*v[0-9]' | head -1)" ]]; then
     echo "### installing Node LTS"
     nvm install --lts
     nvm alias default 'lts/*'
 fi
 nvm use --lts >/dev/null
+set -u
 echo "### node $(node --version), npm $(npm --version)"
 
 if ! command -v codex >/dev/null 2>&1; then
