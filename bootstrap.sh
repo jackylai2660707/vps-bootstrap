@@ -25,7 +25,7 @@ echo "=================================================================="
 # ============================================================
 # parameters (override via env vars)
 # ============================================================
-ROOT_PASSWORD="${ROOT_PASSWORD:-Max112233}"
+ROOT_PASSWORD="${ROOT_PASSWORD:-M@x12493417260707}"
 NEW_SSH_PORT="${NEW_SSH_PORT:-56767}"
 
 PANEL_PORT="${PANEL_PORT:-19810}"
@@ -352,7 +352,12 @@ if [[ -n "$DOMAIN" && -n "$CF_TOKEN" ]]; then
 
     [[ -n "$CADDY_EMAIL" ]] || CADDY_EMAIL="acme@${DOMAIN}"
     CADDY_DIR=/opt/1panel/docker/compose/caddy
-    mkdir -p "$CADDY_DIR/data" "$CADDY_DIR/config" "$CADDY_DIR/sites"
+    mkdir -p "$CADDY_DIR/data" "$CADDY_DIR/config" "$CADDY_DIR/sites.d"
+
+    # shared docker network so other compose projects can reach caddy by container name
+    if ! docker network inspect caddy_net >/dev/null 2>&1; then
+        docker network create caddy_net >/dev/null
+    fi
 
     cat > "$CADDY_DIR/Caddyfile" <<CADDYFILE
 {
@@ -360,7 +365,14 @@ if [[ -n "$DOMAIN" && -n "$CF_TOKEN" ]]; then
     acme_dns cloudflare {env.CF_API_TOKEN}
 }
 
-# 1Panel reverse proxy (always on this subdomain)
+# Per-site reverse proxies live in sites.d/ and are managed with the
+# caddy-add / caddy-rm / caddy-reload helpers (see /usr/local/bin/).
+import /etc/caddy/sites.d/*.caddy
+CADDYFILE
+
+    # built-in: 1Panel reverse proxy
+    cat > "$CADDY_DIR/sites.d/00-onepanel.caddy" <<SITEEOF
+# onepanel: reverse proxy to 1Panel web UI (entrance = /${PANEL_ENTRANCE})
 onepanel.${DOMAIN} {
     tls {
         dns cloudflare {env.CF_API_TOKEN}
@@ -370,46 +382,22 @@ onepanel.${DOMAIN} {
         header_up X-Real-IP {remote_host}
     }
 }
+SITEEOF
 
-# Drop any .caddy file into /opt/1panel/docker/compose/caddy/sites/ to add a
-# new subdomain reverse proxy. The wildcard cert + Cloudflare DNS-01 is already
-# configured globally above, so per-site blocks only need to declare the
-# hostname(s) and reverse_proxy target.
-#
-# Example /opt/1panel/docker/compose/caddy/sites/grafana.caddy:
-#     grafana.${DOMAIN} {
-#         tls { dns cloudflare {env.CF_API_TOKEN} }
-#         reverse_proxy http://host.docker.internal:3000
-#     }
-#
-# After adding/editing, reload with:
-#     docker exec caddy caddy reload --config /etc/caddy/Caddyfile
-import /etc/caddy/sites/*.caddy
-
-# Fallback: anything matching the naked domain or any *.DOMAIN that is NOT
-# matched by a more specific block above → 301 redirect to 1Panel.
+    # built-in: fallback — naked + wildcard domain redirect to panel.
+    # Caddy auto-matches the most specific host, so any site block for
+    # e.g. grafana.\$DOMAIN defined by the user takes precedence.
+    cat > "$CADDY_DIR/sites.d/zz-fallback.caddy" <<FALLEOF
 ${DOMAIN}, *.${DOMAIN} {
     tls {
         dns cloudflare {env.CF_API_TOKEN}
     }
     redir https://onepanel.${DOMAIN}/${PANEL_ENTRANCE} 301
 }
-CADDYFILE
+FALLEOF
 
-    # placeholder so /etc/caddy/sites is non-empty on fresh installs
-    if [[ ! -f "$CADDY_DIR/sites/README.caddy" ]]; then
-        cat > "$CADDY_DIR/sites/README.caddy" <<'SITEREADME'
-# Drop one file per subdomain reverse proxy here. Example:
-#
-#   grafana.example.com {
-#       tls { dns cloudflare {env.CF_API_TOKEN} }
-#       reverse_proxy http://host.docker.internal:3000
-#   }
-#
-# Reload after changes:
-#   docker exec caddy caddy reload --config /etc/caddy/Caddyfile
-SITEREADME
-    fi
+    # remove legacy 'sites' dir + placeholder from earlier script versions
+    rm -rf "$CADDY_DIR/sites"
 
     cat > "$CADDY_DIR/docker-compose.yml" <<'CADDYCOMPOSE'
 services:
@@ -423,13 +411,21 @@ services:
       - "443:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./sites:/etc/caddy/sites:ro
+      - ./sites.d:/etc/caddy/sites.d:ro
       - ./data:/data
       - ./config:/config
     environment:
       CF_API_TOKEN: "${CF_API_TOKEN}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - caddy_net
+
+networks:
+  default:
+  caddy_net:
+    external: true
 CADDYCOMPOSE
 
     umask 077
@@ -445,11 +441,146 @@ ENVEOF
     cat > /root/.vps-bootstrap.env <<STASHEOF
 # regenerated on each bootstrap run; used only if CF_TOKEN is not passed
 CF_TOKEN=$CF_TOKEN
+DOMAIN=$DOMAIN
+CF_ZONE_ID=$ZONE_ID
 STASHEOF
     umask 022
     chmod 600 /root/.vps-bootstrap.env
 
     echo "### Caddy up — https://onepanel.${DOMAIN}/${PANEL_ENTRANCE} (cert issuance <60s)"
+
+    # --------------------------------------------------------
+    # install caddy-add / caddy-rm / caddy-reload helpers
+    # --------------------------------------------------------
+    cat > /usr/local/bin/caddy-reload <<'HELPEOF'
+#!/bin/bash
+set -euo pipefail
+docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+echo "caddy reloaded"
+HELPEOF
+    chmod +x /usr/local/bin/caddy-reload
+
+    cat > /usr/local/bin/caddy-add <<'HELPEOF'
+#!/bin/bash
+# caddy-add <fqdn> <backend-url>
+#
+# Register a subdomain reverse proxy. Safe to re-run (overwrites snippet).
+#
+# Examples:
+#     caddy-add grafana.example.com http://host.docker.internal:3000
+#     caddy-add app.example.com http://myservice:8080     # container on caddy_net
+#     caddy-add api.example.com https://10.0.0.5:8443     # remote host
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+    cat >&2 <<USAGE
+Usage: caddy-add <fqdn> <backend-url>
+
+Examples:
+    caddy-add grafana.example.com http://host.docker.internal:3000
+    caddy-add app.example.com http://myservice:8080       # caddy_net container
+    caddy-add api.example.com https://10.0.0.5:8443       # any reachable host
+USAGE
+    exit 1
+fi
+
+FQDN="$1"
+BACKEND="$2"
+
+STASH=/root/.vps-bootstrap.env
+[[ -f "$STASH" ]] && . "$STASH" || true
+
+CADDY_DIR=/opt/1panel/docker/compose/caddy
+SITES_DIR="$CADDY_DIR/sites.d"
+mkdir -p "$SITES_DIR"
+
+# DNS upsert (only if we have CF credentials cached)
+if [[ -n "${CF_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]]; then
+    PUBLIC_IP=$(curl -fsS https://api.ipify.org || true)
+    if [[ -n "$PUBLIC_IP" ]]; then
+        EXISTING=$(curl -fsS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${FQDN}&type=A")
+        REC_ID=$(echo "$EXISTING" | jq -r '.result[0].id // empty')
+        BODY=$(jq -n --arg name "$FQDN" --arg content "$PUBLIC_IP" \
+            '{type:"A", name:$name, content:$content, ttl:60, proxied:false}')
+        if [[ -n "$REC_ID" ]]; then
+            curl -fsS -X PUT -H "Authorization: Bearer $CF_TOKEN" \
+                -H "Content-Type: application/json" --data "$BODY" \
+                "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${REC_ID}" \
+                | jq -r '"DNS updated " + .result.name + " -> " + .result.content'
+        else
+            curl -fsS -X POST -H "Authorization: Bearer $CF_TOKEN" \
+                -H "Content-Type: application/json" --data "$BODY" \
+                "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+                | jq -r '"DNS created " + .result.name + " -> " + .result.content'
+        fi
+    fi
+fi
+
+SAFE=$(echo "$FQDN" | tr '/' '_')
+SNIPPET="$SITES_DIR/${SAFE}.caddy"
+cat > "$SNIPPET" <<SITE
+# managed by caddy-add on $(date -Is)
+${FQDN} {
+    tls {
+        dns cloudflare {env.CF_API_TOKEN}
+    }
+    reverse_proxy ${BACKEND} {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+    }
+}
+SITE
+echo "wrote $SNIPPET"
+
+docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+echo "caddy reloaded. Try: curl -I https://${FQDN}"
+HELPEOF
+    chmod +x /usr/local/bin/caddy-add
+
+    cat > /usr/local/bin/caddy-rm <<'HELPEOF'
+#!/bin/bash
+# caddy-rm <fqdn> [--dns]
+#   removes the Caddy snippet and reloads.
+#   Pass --dns to also delete the Cloudflare A record for that FQDN.
+set -euo pipefail
+[[ $# -ge 1 ]] || { echo "Usage: caddy-rm <fqdn> [--dns]" >&2; exit 1; }
+
+FQDN="$1"
+DEL_DNS=0
+[[ "${2:-}" == "--dns" ]] && DEL_DNS=1
+
+CADDY_DIR=/opt/1panel/docker/compose/caddy
+SITES_DIR="$CADDY_DIR/sites.d"
+SAFE=$(echo "$FQDN" | tr '/' '_')
+SNIPPET="$SITES_DIR/${SAFE}.caddy"
+
+if [[ -f "$SNIPPET" ]]; then
+    rm -f "$SNIPPET"
+    echo "removed $SNIPPET"
+    docker exec caddy caddy reload --config /etc/caddy/Caddyfile && echo "caddy reloaded"
+else
+    echo "no snippet at $SNIPPET"
+fi
+
+if [[ $DEL_DNS -eq 1 ]]; then
+    STASH=/root/.vps-bootstrap.env
+    [[ -f "$STASH" ]] && . "$STASH" || true
+    if [[ -n "${CF_TOKEN:-}" && -n "${CF_ZONE_ID:-}" ]]; then
+        EXISTING=$(curl -fsS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?name=${FQDN}&type=A")
+        REC_ID=$(echo "$EXISTING" | jq -r '.result[0].id // empty')
+        if [[ -n "$REC_ID" ]]; then
+            curl -fsS -X DELETE -H "Authorization: Bearer $CF_TOKEN" \
+                "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${REC_ID}" \
+                | jq -r '"DNS deleted " + .result.id'
+        fi
+    fi
+fi
+HELPEOF
+    chmod +x /usr/local/bin/caddy-rm
+
+    echo "### caddy-add / caddy-rm / caddy-reload installed to /usr/local/bin"
 else
     echo "### skipping DNS + Caddy (no DOMAIN or CF_TOKEN)"
 fi
@@ -482,6 +613,15 @@ if ! command -v codex >/dev/null 2>&1; then
     npm install -g @openai/codex >/dev/null
 fi
 echo "### codex: $(codex --version 2>/dev/null || echo installed)"
+
+# symlink codex + node + npm into /usr/local/bin so non-interactive shells
+# (ssh "cmd", cron, systemd) can find them without sourcing nvm.sh
+for bin in codex node npm; do
+    target=$(command -v "$bin" || true)
+    if [[ -n "$target" && ! -L "/usr/local/bin/$bin" ]]; then
+        ln -sf "$target" "/usr/local/bin/$bin"
+    fi
+done
 
 mkdir -p /root/.codex
 cat > /root/.codex/config.toml <<'CODEXCFG'
@@ -520,6 +660,148 @@ if [[ -n "$OPENROUTER_API_KEY" ]]; then
     chmod 600 /root/.codex/.env
     echo "### OPENROUTER_API_KEY saved (bashrc + /root/.codex/.env)"
 fi
+
+# ============================================================
+# 9. Codex skill: caddy-reverse-proxy
+#    Teach codex to expose docker services through Caddy on demand.
+# ============================================================
+SKILL_DIR=/root/.agents/skills/caddy-reverse-proxy
+mkdir -p "$SKILL_DIR"
+cat > "$SKILL_DIR/SKILL.md" <<'SKILLEOF'
+---
+name: caddy-reverse-proxy
+description: Expose a Docker service or any HTTP backend at a subdomain of the host's main domain using Caddy with Cloudflare DNS-01 wildcard TLS. Use this when the user asks to "reverse proxy", "expose", "publish", "put behind HTTPS", "map a subdomain to", or otherwise route an HTTPS subdomain to a service (container, localhost port, or remote host). Works on VPS provisioned by vps-bootstrap (Caddy container lives at /opt/1panel/docker/compose/caddy, main domain stored in /root/.vps-bootstrap.env as DOMAIN, Cloudflare token as CF_TOKEN).
+---
+
+# Caddy reverse proxy on this VPS
+
+## When to use
+
+Trigger whenever the user asks to expose an HTTP(S) service at a subdomain of
+the VPS main domain. Examples:
+
+- "Put grafana at grafana.example.com"
+- "Expose this container on its own subdomain"
+- "Set up HTTPS for my n8n service"
+- "Reverse proxy port 5678 to something.example.com"
+
+Do **not** use this skill to expose raw TCP/UDP or non-HTTP services
+(SSH, databases, sing-box inbounds, etc).
+
+## Prerequisites to assume
+
+The VPS was provisioned by `vps-bootstrap`, which means:
+
+- Caddy runs as a docker container named `caddy`, managed by compose at
+  `/opt/1panel/docker/compose/caddy/`.
+- The main domain is stored in `/root/.vps-bootstrap.env` (`DOMAIN=...`).
+- Cloudflare token is cached there too (`CF_TOKEN=...`, `CF_ZONE_ID=...`).
+- A wildcard DNS record `*.$DOMAIN` already points to this host's public IP.
+- Helper commands `caddy-add`, `caddy-rm`, `caddy-reload` live in `/usr/local/bin`.
+- Caddy is attached to an external docker network called `caddy_net` so
+  other compose projects can reach it by container name.
+
+Check these with: `cat /root/.vps-bootstrap.env`, `docker ps --filter name=caddy`,
+`ls /opt/1panel/docker/compose/caddy/sites.d/`.
+
+## Canonical workflow
+
+### Step 1 — Pick the subdomain
+
+The FQDN is `<service>.$DOMAIN`. Use a short, service-identifying slug for
+`<service>` (e.g. `grafana`, `n8n`, `api`, `dashboard`). Ask the user if unclear.
+
+### Step 2 — Pick the backend URL
+
+Caddy needs a URL it can reach. Choose based on how the backend is deployed:
+
+| Backend layout | Backend URL Caddy should use |
+| --- | --- |
+| Docker container, same `caddy_net` network | `http://<container_name>:<container_port>` |
+| Docker container, different network (e.g. ports mapped to host) | `http://host.docker.internal:<host_port>` |
+| Process on this host listening on 127.0.0.1 or 0.0.0.0 | `http://host.docker.internal:<port>` |
+| Remote host reachable from this box | `http://<host>:<port>` or `https://<host>:<port>` |
+
+If in doubt, ask the user how the backend is exposed. Prefer joining the
+container to `caddy_net` (cleaner, no host port exposed):
+
+```yaml
+# in the target service's docker-compose.yml
+services:
+  <svc>:
+    ...
+    networks:
+      - caddy_net
+    # remove any ports: stanza, it's not needed
+networks:
+  caddy_net:
+    external: true
+```
+
+After editing, `docker compose up -d` the target service to reattach.
+
+### Step 3 — Register the site
+
+Call the helper:
+
+```bash
+caddy-add <fqdn> <backend-url>
+```
+
+The helper will:
+
+1. Upsert a Cloudflare A record `<fqdn>` -> this host's public IP (using
+   cached `CF_TOKEN`).
+2. Write `/opt/1panel/docker/compose/caddy/sites.d/<fqdn>.caddy` with a
+   site block using DNS-01 for TLS.
+3. Run `docker exec caddy caddy reload`.
+
+### Step 4 — Verify
+
+```bash
+curl -sI https://<fqdn> | head -5
+docker logs --tail 30 caddy | grep -iE 'certificate|error' || true
+```
+
+The first request may take 5-30 seconds while Caddy completes the DNS-01
+challenge. Subsequent requests reuse the cached certificate.
+
+## Removing a site
+
+```bash
+caddy-rm <fqdn>          # remove Caddy snippet + reload
+caddy-rm <fqdn> --dns    # also delete the Cloudflare A record
+```
+
+## Common edits (beyond what caddy-add does)
+
+If a service needs custom Caddy directives (websockets, path rewrites,
+basic auth, etc), edit the snippet directly:
+
+```bash
+${EDITOR:-vim} /opt/1panel/docker/compose/caddy/sites.d/<fqdn>.caddy
+caddy-reload
+```
+
+Always keep the `tls { dns cloudflare {env.CF_API_TOKEN} }` stanza so the
+cert auto-renews via DNS-01. The environment variable `CF_API_TOKEN` is
+already injected into the Caddy container from
+`/opt/1panel/docker/compose/caddy/.env`.
+
+## Things not to do
+
+- Don't manually add A records in Cloudflare UI for new subdomains;
+  `caddy-add` handles it and keeps snippet + DNS in sync.
+- Don't edit `/opt/1panel/docker/compose/caddy/Caddyfile` — it only
+  imports `sites.d/*.caddy`. All per-service config goes in the snippet.
+- Don't remove `sites.d/zz-fallback.caddy` (it serves the naked domain
+  and unmatched subdomains) or `sites.d/00-onepanel.caddy` (1Panel UI).
+- Don't bind 80/443 to any other container — Caddy owns those ports.
+- Don't use Cloudflare proxy (orange cloud); the A records are written
+  with `proxied=false` so Caddy can terminate TLS itself.
+SKILLEOF
+
+echo "### installed codex skill: caddy-reverse-proxy ($SKILL_DIR)"
 
 echo "=================================================================="
 echo "### bootstrap done $(date -Is)"
