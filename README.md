@@ -25,6 +25,8 @@ Personal one-liner VPS provisioning script for Ubuntu 22.04 / 24.04.
    - Issues a Let's Encrypt SAN certificate (naked + wildcard) via DNS-01
    - Reverse proxies `onepanel.$DOMAIN/Jpanel` → 1Panel
    - 301-redirects everything else on `$DOMAIN` / `*.$DOMAIN` to 1Panel
+   - Creates `/opt/1panel/docker/compose/caddy/sites/` — drop one `.caddy`
+     file per subdomain to add a new reverse proxy; main Caddyfile auto-imports them
 9. Installs **nvm**, Node **LTS**, and **`@openai/codex`** globally
 10. Writes `/root/.codex/config.toml` — provider `openrouter` pointing at
     `https://api.yueseng-ys.com/v1`, model `gpt-5.5`, `approval_policy=never`,
@@ -68,6 +70,26 @@ DOMAIN=another.example.com bash <(curl -fsSL https://raw.githubusercontent.com/j
 - **Zone → Zone → Read**
 
 Scoped to whichever zone covers your domain.
+
+## Adding more reverse-proxy subdomains later
+
+The wildcard A record `*.$DOMAIN` is already pointing at the box and Caddy is
+already configured to obtain DNS-01 certificates for anything under that zone,
+so new subdomains need zero DNS changes.
+
+```bash
+# SSH to the box
+cat > /opt/1panel/docker/compose/caddy/sites/grafana.caddy <<'EOF'
+grafana.your.domain {
+    tls { dns cloudflare {env.CF_API_TOKEN} }
+    reverse_proxy http://host.docker.internal:3000
+}
+EOF
+
+docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+```
+
+Any subdomain with an explicit block wins; everything else still 301s to 1Panel.
 
 ## Notes
 

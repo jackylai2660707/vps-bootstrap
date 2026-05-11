@@ -352,7 +352,7 @@ if [[ -n "$DOMAIN" && -n "$CF_TOKEN" ]]; then
 
     [[ -n "$CADDY_EMAIL" ]] || CADDY_EMAIL="acme@${DOMAIN}"
     CADDY_DIR=/opt/1panel/docker/compose/caddy
-    mkdir -p "$CADDY_DIR/data" "$CADDY_DIR/config"
+    mkdir -p "$CADDY_DIR/data" "$CADDY_DIR/config" "$CADDY_DIR/sites"
 
     cat > "$CADDY_DIR/Caddyfile" <<CADDYFILE
 {
@@ -360,6 +360,7 @@ if [[ -n "$DOMAIN" && -n "$CF_TOKEN" ]]; then
     acme_dns cloudflare {env.CF_API_TOKEN}
 }
 
+# 1Panel reverse proxy (always on this subdomain)
 onepanel.${DOMAIN} {
     tls {
         dns cloudflare {env.CF_API_TOKEN}
@@ -370,6 +371,23 @@ onepanel.${DOMAIN} {
     }
 }
 
+# Drop any .caddy file into /opt/1panel/docker/compose/caddy/sites/ to add a
+# new subdomain reverse proxy. The wildcard cert + Cloudflare DNS-01 is already
+# configured globally above, so per-site blocks only need to declare the
+# hostname(s) and reverse_proxy target.
+#
+# Example /opt/1panel/docker/compose/caddy/sites/grafana.caddy:
+#     grafana.${DOMAIN} {
+#         tls { dns cloudflare {env.CF_API_TOKEN} }
+#         reverse_proxy http://host.docker.internal:3000
+#     }
+#
+# After adding/editing, reload with:
+#     docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+import /etc/caddy/sites/*.caddy
+
+# Fallback: anything matching the naked domain or any *.DOMAIN that is NOT
+# matched by a more specific block above → 301 redirect to 1Panel.
 ${DOMAIN}, *.${DOMAIN} {
     tls {
         dns cloudflare {env.CF_API_TOKEN}
@@ -377,6 +395,21 @@ ${DOMAIN}, *.${DOMAIN} {
     redir https://onepanel.${DOMAIN}/${PANEL_ENTRANCE} 301
 }
 CADDYFILE
+
+    # placeholder so /etc/caddy/sites is non-empty on fresh installs
+    if [[ ! -f "$CADDY_DIR/sites/README.caddy" ]]; then
+        cat > "$CADDY_DIR/sites/README.caddy" <<'SITEREADME'
+# Drop one file per subdomain reverse proxy here. Example:
+#
+#   grafana.example.com {
+#       tls { dns cloudflare {env.CF_API_TOKEN} }
+#       reverse_proxy http://host.docker.internal:3000
+#   }
+#
+# Reload after changes:
+#   docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+SITEREADME
+    fi
 
     cat > "$CADDY_DIR/docker-compose.yml" <<'CADDYCOMPOSE'
 services:
@@ -390,6 +423,7 @@ services:
       - "443:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./sites:/etc/caddy/sites:ro
       - ./data:/data
       - ./config:/config
     environment:
