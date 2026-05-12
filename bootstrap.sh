@@ -1137,9 +1137,9 @@ services:
     image: jeessy/ddns-go:latest
     container_name: ddns-go
     restart: unless-stopped
-    # bind only to 127.0.0.1 — the UI is only reached via Caddy reverse proxy
+    # bind to all interfaces so Caddy can reach it via host.docker.internal
     ports:
-      - "127.0.0.1:9876:9876"
+      - "9876:9876"
     volumes:
       - ./conf:/root
     environment:
