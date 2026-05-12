@@ -300,15 +300,33 @@ SB_DIR="/opt/1panel/docker/compose/singbox"
 SB_CFG="${SB_DIR}/config"
 mkdir -p "$SB_CFG"
 
-if [[ ! -f "${SB_CFG}/cert.pem" || ! -f "${SB_CFG}/key.pem" ]]; then
-    openssl req -x509 -newkey ec:<(openssl ecparam -name prime256v1) \
-        -nodes -days 3650 \
-        -keyout "${SB_CFG}/key.pem" \
-        -out    "${SB_CFG}/cert.pem" \
-        -subj   "/CN=${HY2_CERT_CN}" \
-        -addext "subjectAltName=DNS:${HY2_CERT_CN}" \
-        2>/dev/null
-    chmod 644 "${SB_CFG}/cert.pem" "${SB_CFG}/key.pem"
+# Determine cert paths: if DOMAIN + Caddy certs exist, use real LE cert;
+# otherwise fall back to self-signed (for no-domain deployments).
+CADDY_CERT_DIR="/opt/1panel/docker/compose/caddy/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory"
+if [[ -n "$DOMAIN" && -f "${CADDY_CERT_DIR}/${DOMAIN}/${DOMAIN}.crt" ]]; then
+    # Use Caddy's real LE certificate for hy2 (no allowInsecure needed on client)
+    HY2_CERT_PATH="/certs/${DOMAIN}/${DOMAIN}.crt"
+    HY2_KEY_PATH="/certs/${DOMAIN}/${DOMAIN}.key"
+    HY2_SERVER_NAME="$DOMAIN"
+    SB_CERT_VOLUME="${CADDY_CERT_DIR}:/certs:ro"
+    echo "### sing-box will use Caddy's LE cert for hy2 (sni=$DOMAIN)"
+else
+    # Self-signed fallback (client needs allowInsecure=true)
+    if [[ ! -f "${SB_CFG}/cert.pem" || ! -f "${SB_CFG}/key.pem" ]]; then
+        openssl req -x509 -newkey ec:<(openssl ecparam -name prime256v1) \
+            -nodes -days 3650 \
+            -keyout "${SB_CFG}/key.pem" \
+            -out    "${SB_CFG}/cert.pem" \
+            -subj   "/CN=${HY2_CERT_CN}" \
+            -addext "subjectAltName=DNS:${HY2_CERT_CN}" \
+            2>/dev/null
+        chmod 644 "${SB_CFG}/cert.pem" "${SB_CFG}/key.pem"
+    fi
+    HY2_CERT_PATH="/etc/sing-box/cert.pem"
+    HY2_KEY_PATH="/etc/sing-box/key.pem"
+    HY2_SERVER_NAME="$HY2_CERT_CN"
+    SB_CERT_VOLUME="${SB_CFG}/cert.pem:/etc/sing-box/cert.pem:ro"
+    echo "### sing-box will use self-signed cert for hy2 (sni=$HY2_CERT_CN, allowInsecure needed)"
 fi
 
 cat > "${SB_CFG}/config.json" <<EOF
@@ -323,10 +341,10 @@ cat > "${SB_CFG}/config.json" <<EOF
       "users": [ { "password": "${HY2_PASSWORD}" } ],
       "tls": {
         "enabled": true,
-        "server_name": "${HY2_CERT_CN}",
+        "server_name": "${HY2_SERVER_NAME}",
         "alpn": ["h3"],
-        "certificate_path": "/etc/sing-box/cert.pem",
-        "key_path": "/etc/sing-box/key.pem"
+        "certificate_path": "${HY2_CERT_PATH}",
+        "key_path": "${HY2_KEY_PATH}"
       }
     },
     {
@@ -354,7 +372,8 @@ cat > "${SB_CFG}/config.json" <<EOF
 }
 EOF
 
-cat > "${SB_DIR}/docker-compose.yml" <<'EOF'
+# docker-compose for sing-box — dynamically set cert volume
+cat > "${SB_DIR}/docker-compose.yml" <<SBCOMPOSE
 services:
   singbox:
     image: ghcr.io/sagernet/sing-box:latest
@@ -365,17 +384,25 @@ services:
       - ./config/config.json:/etc/sing-box/config.json:ro
       - ./config/cert.pem:/etc/sing-box/cert.pem:ro
       - ./config/key.pem:/etc/sing-box/key.pem:ro
+      - ${SB_CERT_VOLUME}
     command: ["run", "-c", "/etc/sing-box/config.json"]
-EOF
+SBCOMPOSE
 
+# validate config (mount both possible cert sources so check passes)
 docker run --rm \
     -v "${SB_CFG}/config.json:/etc/sing-box/config.json:ro" \
     -v "${SB_CFG}/cert.pem:/etc/sing-box/cert.pem:ro" \
     -v "${SB_CFG}/key.pem:/etc/sing-box/key.pem:ro" \
+    -v "${CADDY_CERT_DIR}:/certs:ro" \
     ghcr.io/sagernet/sing-box:latest check -c /etc/sing-box/config.json
 
-(cd "$SB_DIR" && docker compose pull && docker compose up -d)
+(cd "$SB_DIR" && docker compose pull && docker compose up -d --force-recreate)
 echo "### sing-box running on ${HY2_PORT}/udp + ${VLESS_PORT}/tcp"
+
+# Daily cron to reload sing-box so it picks up renewed certs from Caddy
+CRON_LINE="0 4 * * * docker restart singbox >/dev/null 2>&1"
+(crontab -l 2>/dev/null | grep -v "docker restart singbox"; echo "$CRON_LINE") | crontab -
+echo "### cron: daily singbox restart at 04:00 for cert renewal pickup"
 
 # ============================================================
 # 7. Cloudflare DNS + Caddy reverse proxy (optional, needs DOMAIN + CF_TOKEN)
