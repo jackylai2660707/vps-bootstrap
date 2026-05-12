@@ -45,6 +45,8 @@ REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-MGXZhVRfzORg721P6ziQRhj7KC6bAC9a3w49
 DOMAIN="${DOMAIN:-}"
 CF_TOKEN="${CF_TOKEN:-}"
 CADDY_EMAIL="${CADDY_EMAIL:-}"
+GH_TOKEN="${GH_TOKEN:-}"
+SKILLS_REPO="${SKILLS_REPO:-jackylai2660707/myskills}"
 OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-Max112233}"
 
 [[ $EUID -eq 0 ]] || { echo "### must run as root" >&2; exit 1; }
@@ -57,6 +59,12 @@ if [[ -z "$DOMAIN" && -r /dev/tty ]]; then
 fi
 
 if [[ -n "$DOMAIN" && -z "$CF_TOKEN" && -f /root/.vps-bootstrap.env ]]; then
+    # shellcheck disable=SC1091
+    . /root/.vps-bootstrap.env
+fi
+
+# If GH_TOKEN was not given but cached, pick it up.
+if [[ -z "$GH_TOKEN" && -f /root/.vps-bootstrap.env ]]; then
     # shellcheck disable=SC1091
     . /root/.vps-bootstrap.env
 fi
@@ -99,7 +107,7 @@ if systemctl list-unit-files firewalld.service >/dev/null 2>&1; then
 fi
 
 apt-get update -qq || true
-apt-get install -y -qq iptables-persistent netfilter-persistent curl jq openssl expect ca-certificates >/dev/null || true
+apt-get install -y -qq iptables-persistent netfilter-persistent curl jq openssl expect ca-certificates apache2-utils >/dev/null || true
 netfilter-persistent save >/dev/null 2>&1 || true
 echo "### firewall opened + persisted"
 
@@ -439,11 +447,12 @@ ENVEOF
 
     umask 077
     cat > /root/.vps-bootstrap.env <<STASHEOF
-# regenerated on each bootstrap run; used only if CF_TOKEN is not passed
+# regenerated on each bootstrap run; used only if env vars are not passed
 CF_TOKEN=$CF_TOKEN
 DOMAIN=$DOMAIN
 CF_ZONE_ID=$ZONE_ID
 STASHEOF
+    [[ -n "${GH_TOKEN:-}" ]] && echo "GH_TOKEN=$GH_TOKEN" >> /root/.vps-bootstrap.env
     umask 022
     chmod 600 /root/.vps-bootstrap.env
 
@@ -662,465 +671,114 @@ if [[ -n "$OPENROUTER_API_KEY" ]]; then
 fi
 
 # ============================================================
-# 9. Codex skill: caddy-reverse-proxy
-#    Teach codex to expose docker services through Caddy on demand.
+# 9. Codex skills: pull from private myskills repo (fallback: embedded)
+#     - install latest gh from GitHub's apt repo (Ubuntu's default pkg
+#       is frequently years old and chokes on auth status / repo clone)
+#     - gh auth login via GH_TOKEN (headless)
+#     - clone/pull $SKILLS_REPO to /opt/skills-src, symlink each folder
+#       under skills/ into /root/.agents/skills/
+#     - if no GH_TOKEN, write the embedded caddy-reverse-proxy skill
 # ============================================================
-SKILL_DIR=/root/.agents/skills/caddy-reverse-proxy
-mkdir -p "$SKILL_DIR"
-cat > "$SKILL_DIR/SKILL.md" <<'SKILLEOF'
+SKILL_ROOT=/root/.agents/skills
+mkdir -p "$SKILL_ROOT"
+
+install_gh() {
+    # idempotent install of the official GitHub CLI apt repo
+    if command -v gh >/dev/null 2>&1; then
+        GH_VER=$(gh --version 2>/dev/null | head -1 | awk '{print $3}')
+        # major version >= 2 is required for gh repo clone + auth flows we use
+        if [[ -n "$GH_VER" && "${GH_VER%%.*}" -ge 2 ]]; then
+            return 0
+        fi
+        apt-get remove -y -qq gh 2>/dev/null || true
+    fi
+    mkdir -p -m 755 /etc/apt/keyrings
+    if [[ ! -f /etc/apt/keyrings/githubcli-archive-keyring.gpg ]]; then
+        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+        chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    fi
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list
+    apt-get update -qq
+    apt-get install -y -qq gh >/dev/null
+}
+
+pull_skills_from_repo() {
+    # requires: GH_TOKEN in env, gh in PATH
+    local repo="$1"   # e.g. jackylai2660707/myskills
+    local src=/opt/skills-src
+
+    export GH_TOKEN
+
+    # non-interactive git over HTTPS uses the token via gh
+    gh auth setup-git 2>/dev/null || true
+
+    if [[ -d "$src/.git" ]]; then
+        git -C "$src" fetch --quiet
+        git -C "$src" reset --hard --quiet "origin/HEAD"
+    else
+        rm -rf "$src"
+        gh repo clone "$repo" "$src" -- --quiet
+    fi
+
+    if [[ ! -d "$src/skills" ]]; then
+        echo "### warn: $repo has no skills/ directory, nothing to install" >&2
+        return 0
+    fi
+
+    # symlink every subfolder of skills/ into /root/.agents/skills/
+    # (symlink = upgrades follow the next bootstrap / manual 'git -C pull')
+    for dir in "$src"/skills/*/; do
+        [[ -d "$dir" ]] || continue
+        name=$(basename "$dir")
+        target="$SKILL_ROOT/$name"
+        # remove any prior symlink or plain directory with the same name
+        rm -rf "$target"
+        ln -s "$dir" "$target"
+        echo "### linked skill: $name -> $dir"
+    done
+}
+
+if [[ -n "$GH_TOKEN" ]]; then
+    echo "### installing latest gh from cli.github.com + pulling skills from $SKILLS_REPO"
+    install_gh
+    if pull_skills_from_repo "$SKILLS_REPO"; then
+        SKILLS_INSTALLED_FROM_REPO=1
+    else
+        SKILLS_INSTALLED_FROM_REPO=0
+    fi
+else
+    echo "### no GH_TOKEN given; will fall back to embedded skill"
+    SKILLS_INSTALLED_FROM_REPO=0
+fi
+
+if [[ "${SKILLS_INSTALLED_FROM_REPO:-0}" -ne 1 ]]; then
+    # Embedded fallback: ship the caddy-reverse-proxy skill inline so a box
+    # without GH_TOKEN still gets the most important skill.
+    FALLBACK_SKILL=/root/.agents/skills/caddy-reverse-proxy
+    mkdir -p "$FALLBACK_SKILL"
+    cat > "$FALLBACK_SKILL/SKILL.md" <<'SKILLEOF'
 ---
 name: caddy-reverse-proxy
 description: Operate Caddy as a Docker reverse proxy for local, Docker Compose, 1Panel, or remote services. Use when exposing an app/API/site through a domain, adding or changing Caddyfile reverse_proxy routes, reusing wildcard certificates, connecting backend containers to an existing Caddy network, validating and reloading Caddy, troubleshooting TLS/certificate/upstream connectivity, or installing a persistent Docker Caddy service when none exists.
 ---
 
-# Caddy Reverse Proxy
+# Caddy Reverse Proxy (embedded fallback)
 
-## vps-bootstrap Fast Path
+On vps-bootstrap hosts use the one-shot helpers:
 
-If this host was provisioned by `vps-bootstrap` (detect with
-`test -x /usr/local/bin/caddy-add && test -f /root/.vps-bootstrap.env`),
-prefer the one-shot helpers and skip discovery:
+- `caddy-add <fqdn> <backend-url>` — creates Cloudflare A record, writes
+  `/opt/1panel/docker/compose/caddy/sites.d/<fqdn>.caddy`, reloads Caddy.
+- `caddy-rm <fqdn> [--dns]` — removes the snippet and reloads.
+- `caddy-reload` — `caddy reload` wrapper.
 
-- `caddy-add <fqdn> <backend-url>` — creates the Cloudflare A record
-  (using cached `CF_TOKEN`), writes
-  `/opt/1panel/docker/compose/caddy/sites.d/<fqdn>.caddy`, and reloads
-  Caddy.
-- `caddy-rm <fqdn> [--dns]` — removes the snippet and reloads; `--dns`
-  also deletes the DNS record.
-- `caddy-reload` — plain `caddy reload` wrapper.
-
-Only fall back to the manual workflow below when:
-- a site needs directives the helper does not emit (WebSocket-specific
-  routing, path rewrites, basic auth, file_server, rate limiting, etc.),
-- the user wants to consolidate several subdomains under a shared
-  wildcard `*.$DOMAIN` block with host matchers (see "Wildcard
-  Certificate Reuse"),
-- something in the helper's DNS upsert / Caddyfile snippet / reload
-  pipeline went wrong and needs hand-inspection.
-
-When you do hand-edit, the managed files live in
-`/opt/1panel/docker/compose/caddy/sites.d/*.caddy`; the top-level
-`Caddyfile` only holds the global block and `import sites.d/*.caddy`.
-After any manual edit, run `caddy-reload` (or
-`docker exec caddy caddy reload --config /etc/caddy/Caddyfile`).
-
-## Operating Principles
-
-- Prefer the existing Docker Caddy container/service. Inspect before creating anything.
-- On 1Panel-style hosts, prefer managing Caddy at `/opt/1panel/docker/compose/caddy`.
-- Edit the host file mounted to `/etc/caddy/Caddyfile`, even if the mount is read-only inside the container.
-- Preserve existing routes and user edits. Add the smallest domain/path block needed.
-- Validate before reload. If validation fails, fix the Caddyfile and do not reload.
-- Reload Caddy in place; recreate only when mounts, ports, image, or networks changed.
-- Prefer private Docker networking for container backends. Do not publish backend ports unless needed for another reason.
-- Prefer wildcard certificate/site blocks for sibling subdomains when DNS automation is available; avoid triggering per-subdomain ACME issuance unnecessarily.
-- For host-machine backends, verify the service listens on `0.0.0.0` or is reachable from the Caddy container.
-- For fresh Docker/Caddy install steps, verify current official documentation first when internet access is available.
-- Treat DNS API tokens as secrets: do not print them, do not run `docker compose config` after they are set unless redacting output, and keep `.env` mode `0600`.
-
-## Fast Workflow
-
-1. Load the host profile cache if it exists, then cheaply verify the named Caddy container and Caddyfile path.
-2. Discover Caddy only if the cache is missing or stale.
-3. Classify the upstream: same Docker network container, host-machine service, or remote URL.
-4. Check whether the hostname is covered by an existing wildcard route/certificate; if not, evaluate whether a wildcard can be created first.
-5. Verify Caddy can reach the upstream before editing when practical.
-6. Add or update the Caddyfile route.
-7. Run `caddy validate`, then `caddy reload`.
-8. Check the public domain, HTTPS certificate behavior, upstream logs, and update the profile cache.
-
-## Host Profile Cache
-
-Do not rediscover the same VPS on every run:
-
-```bash
-PROFILE_DIR="${CODEX_HOME:-$HOME/.codex}/state/caddy-reverse-proxy"
-HOST_ID="$(hostname -f 2>/dev/null || hostname)"
-PROFILE="$PROFILE_DIR/$HOST_ID.md"
-test -f "$PROFILE" && sed -n '1,220p' "$PROFILE"
-```
-
-Validate cached facts before trusting them:
-
-```bash
-docker ps --format '{{.Names}}' | grep -Fx '<caddy-container-name>'
-test -f '<host-caddyfile-path>'
-```
-
-Record or update at least:
-
-```markdown
-# Caddy Reverse Proxy Host Profile
-
-- hostname:
-- last_verified:
-- caddy_container:
-- compose_project_dir:
-- compose_service:
-- host_caddyfile_path:
-- container_caddyfile_path: /etc/caddy/Caddyfile
-- data_volume_or_mount:
-- config_volume_or_mount:
-- published_ports:
-- docker_network:
-- host_gateway_for_container:
-- host_gateway_alias:
-- wildcard_domains:
-- wildcard_route_style:
-- reload_command:
-- validate_command:
-- notes:
-```
-
-Keep this cache outside the skill directory so one machine's paths do not leak into another.
-
-## Discovery
-
-Use cheap, focused checks first. Common 1Panel and manual Compose roots include `/opt/1panel/docker/compose` and `/root/compose`.
-
-```bash
-docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}' | grep -i caddy || true
-find /opt/1panel/docker/compose /root/compose . -maxdepth 4 \( -iname 'Caddyfile' -o -iname 'compose.yml' -o -iname 'docker-compose.yml' \) 2>/dev/null
-docker inspect <caddy-container> --format '{{json .Mounts}}'
-docker inspect <caddy-container> --format '{{json .NetworkSettings.Networks}}'
-```
-
-Identify:
-
-- Caddy container name and, if applicable, Compose project directory/service.
-- Host path mounted to `/etc/caddy/Caddyfile`.
-- Persistent `/data` and `/config` mounts.
-- Published ports, especially `80`, `443`, and `443/udp`.
-- Docker network shared with app containers.
-- Whether `host.docker.internal` is configured through `host-gateway`.
-- Existing wildcard site blocks such as `*.example.com` and how they route subdomains.
-- Installed DNS provider modules: `docker exec <caddy-container> caddy list-modules | grep '^dns.providers.' || true`.
-
-If `/etc/caddy/Caddyfile` is not bind-mounted, inspect Compose config and container command before deciding how to persist edits.
-
-## Preferred 1Panel Layout
-
-When the user wants Caddy standardized on a 1Panel host, use:
-
-```text
-/opt/1panel/docker/compose/caddy/
-├── Caddyfile
-├── Dockerfile
-├── docker-compose.yml
-├── data/
-└── config/
-```
-
-If an existing Caddy lives elsewhere, copy `Caddyfile`, `data`, and `config` into that directory, recreate the container from the new Compose project, verify domains, then rename the old directory to a timestamped backup. Preserve:
-
-- `container_name: caddy`
-- published ports `80:80`, `443:443`, `443:443/udp`
-- `/data` and `/config`
-- the `caddy_default` Docker network name when other app containers already depend on it
-- `extra_hosts: ["host.docker.internal:host-gateway"]`
-
-Use a custom local image when DNS provider modules are needed:
-
-```dockerfile
-FROM caddy:2-builder AS builder
-
-RUN xcaddy build \
-    --with github.com/caddy-dns/cloudflare
-
-FROM caddy:2
-
-COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-```
-
-Compose baseline:
-
-```yaml
-services:
-  caddy:
-    build:
-      context: .
-    image: local/caddy-cloudflare:2
-    container_name: caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    environment:
-      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./data:/data
-      - ./config:/config
-```
-
-After building, confirm the module exists before changing TLS policy:
-
-```bash
-docker run --rm local/caddy-cloudflare:2 caddy list-modules | grep '^dns.providers.cloudflare$'
-```
-
-## Upstream Selection
-
-Choose the most private stable upstream:
-
-1. **Backend is a Docker/Compose service**: attach it to Caddy's Docker network and proxy to service/container DNS, e.g. `reverse_proxy app:3000`.
-2. **Backend is on the host**: prefer `host.docker.internal:<port>` when Caddy has `extra_hosts: ["host.docker.internal:host-gateway"]`; otherwise use the gateway of Caddy's Docker network, not blindly `172.17.0.1`.
-3. **Backend is remote**: proxy to the remote URL/host and preserve Host header only when the upstream requires it.
-
-Do not use a container IP in the Caddyfile unless there is no better option; IPs change after recreation.
-
-For a backend container that should join Caddy's network:
-
-```yaml
-services:
-  app:
-    networks:
-      - caddy_default
-
-networks:
-  caddy_default:
-    external: true
-```
-
-For a host-machine process, confirm listening behavior:
-
-```bash
-ss -ltnp | grep ':3000'
-docker exec <caddy-container> wget -S -O- http://host.docker.internal:3000/ 2>&1 | head
-```
-
-If the process only binds `127.0.0.1`, change its server flags/env to bind `0.0.0.0`, or use a deliberate host networking/tunnel approach.
-
-## Caddyfile Patterns
-
-Simple container backend:
-
-```caddyfile
-example.com {
-    encode zstd gzip
-    reverse_proxy app:3000
-}
-```
-
-Host-machine backend:
-
-```caddyfile
-example.com {
-    encode zstd gzip
-    reverse_proxy host.docker.internal:3000
-}
-```
-
-Path-scoped backend while preserving an existing site:
-
-```caddyfile
-example.com {
-    encode zstd gzip
-
-    handle_path /api/* {
-        reverse_proxy api:8080
-    }
-
-    handle {
-        reverse_proxy web:80
-    }
-}
-```
-
-Only add explicit WebSocket matchers when the existing app requires special routing; Caddy normally proxies WebSocket upgrades automatically.
-
-## Wildcard Certificate Reuse
-
-A wildcard certificate for `*.example.com` covers one-label subdomains such as `sub.example.com`; it does not cover `example.com` or `a.b.example.com`.
-
-### Wildcard-First Policy
-
-When the user asks to expose `sub.example.com` and the domain shape suggests repeated sibling subdomains, prefer this order:
-
-1. Reuse an existing `*.example.com` route/certificate.
-2. If none exists, create a `*.example.com` wildcard site block when Caddy has a usable DNS provider module and DNS API credentials.
-3. If Caddy lacks the DNS module or credentials, explain the blocker and either prepare the Caddy DNS plugin setup or fall back to a one-off `sub.example.com` certificate only if the user still wants immediate exposure.
-
-Do not attempt wildcard ACME issuance with HTTP-01/TLS-ALPN only. Wildcard certificates require DNS validation. In Caddyfile, that means a `tls { dns <provider> ... }` policy, or an equivalent global DNS provider option, and a Caddy build that includes the provider module.
-
-Before creating the wildcard block, determine:
-
-- Parent wildcard name, e.g. `sub.example.com` -> `*.example.com`.
-- DNS provider and authoritative zone, using existing user context and commands such as `dig NS example.com`.
-- Whether Caddy includes the provider module:
-
-```bash
-docker exec <caddy-container> caddy list-modules | grep '^dns.providers.'
-```
-
-- Whether the Caddy container has the needed credential env vars or secret files.
-- Whether replacing `caddy:2` with a custom Caddy image containing the DNS plugin is in scope. Preserve `/data`, `/config`, ports, networks, and Caddyfile mounts if changing the image.
-
-For Cloudflare-hosted zones, expect `dns.providers.cloudflare` and `CLOUDFLARE_API_TOKEN`. If the token is absent or blank, build/install the plugin and leave exact-host routing in place; do not add `tls { dns cloudflare ... }` until a real token is configured.
-
-On vps-bootstrap hosts, the token is stored as `CF_API_TOKEN` in
-`/opt/1panel/docker/compose/caddy/.env` and exposed to Caddy as
-`{env.CF_API_TOKEN}` — reuse that variable name rather than
-introducing `CLOUDFLARE_API_TOKEN`.
-
-After writing or changing `.env`, recreate Caddy so the environment is present before validating a Caddyfile that uses `{env.CF_API_TOKEN}`:
-
-```bash
-chmod 600 /opt/1panel/docker/compose/caddy/.env
-docker compose up -d
-```
-
-Common wildcard-first route pattern:
-
-```caddyfile
-*.example.com {
-    tls {
-        dns cloudflare {env.CF_API_TOKEN}
-    }
-
-    @sub host sub.example.com
-    handle @sub {
-        reverse_proxy sub-store:3001
-    }
-
-    handle {
-        abort
-    }
-}
-```
-
-If the apex domain also needs the same certificate policy, include it intentionally:
-
-```caddyfile
-example.com, *.example.com {
-    tls {
-        dns cloudflare {env.CF_API_TOKEN}
-    }
-
-    @sub host sub.example.com
-    handle @sub {
-        reverse_proxy sub-store:3001
-    }
-}
-```
-
-When the requested hostname is covered by an existing wildcard site/certificate, prefer adding a host matcher inside the wildcard site block instead of creating a separate exact hostname block. This keeps routing under the wildcard TLS policy and avoids unnecessary per-subdomain certificate issuance.
-
-Preferred pattern:
-
-```caddyfile
-*.example.com {
-    encode zstd gzip
-
-    @sub host sub.example.com
-    handle @sub {
-        reverse_proxy sub-store:3001
-    }
-
-    @api host api.example.com
-    handle @api {
-        reverse_proxy api:8080
-    }
-
-    handle {
-        abort
-    }
-}
-```
-
-Use a separate `sub.example.com { ... }` block only when there is no wildcard block to reuse, when the user explicitly wants a dedicated certificate/policy, or when the existing Caddyfile architecture already uses exact host blocks and changing it would be broader than the request.
-
-After reload, inspect Caddy logs. Wildcard-first setup should show ACME work for `*.example.com`, not repeated orders for every exact sibling subdomain. A reused wildcard route should not show a new ACME order for the exact subdomain; if it does, revisit the Caddyfile structure before repeating reloads.
-
-## Validate And Reload
-
-Prefer the discovered commands from the profile. Direct container form:
-
-```bash
-docker exec <caddy-container> caddy validate --config /etc/caddy/Caddyfile
-docker exec <caddy-container> caddy reload --config /etc/caddy/Caddyfile
-```
-
-Compose-managed form:
-
-```bash
-docker compose exec <caddy-service> caddy validate --config /etc/caddy/Caddyfile
-docker compose exec <caddy-service> caddy reload --config /etc/caddy/Caddyfile
-```
-
-If Caddy reports formatting warnings only, optionally normalize the host Caddyfile with `caddy fmt`; do not mix formatting churn with unrelated route changes unless it helps reduce future diffs.
-
-## Verification
-
-Check from the Caddy container first, then from the public domain:
-
-```bash
-docker exec <caddy-container> wget -S -O- http://app:3000/ 2>&1 | head -40
-curl -I --max-time 20 http://example.com
-curl -I --max-time 20 https://example.com
-docker logs --tail=120 <caddy-container>
-docker logs --tail=120 <backend-container>
-```
-
-Expected outcomes:
-
-- HTTP normally returns Caddy's `308` redirect to HTTPS.
-- HTTPS returns the upstream status, commonly `200`, `204`, `301`, or an app-specific auth redirect.
-- Caddy logs show certificate obtain/renew success for new domains, or no new TLS work if a cert already exists.
-- When reusing a wildcard certificate, Caddy logs should not show a new ACME order for the exact subdomain.
-- For API services, test a real health endpoint, not only `/`.
-
-If HTTPS fails:
-
-- Confirm DNS A/AAAA records point to this server.
-- Confirm ports `80` and `443` are reachable externally and published by Caddy.
-- Inspect Caddy ACME logs for challenge failures.
-- Avoid repeated reload loops that can trigger CA rate limits.
-
-## Install Docker Caddy When Missing
-
-Install only when no usable Caddy container exists. Use persistent `/data` and `/config`, publish HTTP/HTTPS, and add `host.docker.internal` for host backends:
-
-```yaml
-services:
-  caddy:
-    image: caddy:2
-    container_name: caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./data:/data
-      - ./config:/config
-```
-
-Start with:
-
-```bash
-docker compose up -d
-```
-
-If Compose is unavailable but Docker works, use an equivalent `docker run` with the same ports, host-gateway alias, Caddyfile bind mount, and persistent data/config mounts.
-
-## Operational Notes
-
-- Keep certificates persistent by preserving Caddy's `/data`.
-- Avoid exposing development/debug servers publicly unless the user explicitly accepts the risk.
-- Prefer one domain block per public hostname unless path routing is required.
-- Prefer one wildcard block with `host` matchers for many sibling subdomains when a wildcard certificate is already in use.
-- When a backend service was just deployed, verify its logs and health before blaming Caddy.
-- After successful changes, update the host profile with the current Caddyfile path, network, gateway alias, wildcard domains, and validation/reload commands.
+For the full skill with discovery, host profile caching, wildcard
+certificate strategy, and troubleshooting, set GH_TOKEN on the next
+bootstrap run so the full skill pulls from the myskills repo.
 SKILLEOF
-
-echo "### installed codex skill: caddy-reverse-proxy ($SKILL_DIR)"
+    echo "### installed embedded fallback skill at $FALLBACK_SKILL"
+fi
 
 # ============================================================
 # 10. ddns-go (optional, needs DOMAIN + CF_TOKEN)
@@ -1146,46 +804,61 @@ services:
       TZ: Asia/Shanghai
 DDNSCOMPOSE
 
-    # Pre-seed the ddns-go config so it runs headless: it already knows the
-    # Cloudflare provider + token + which domains to keep in sync. The UI
-    # (reverse-proxied via Caddy) lets you inspect / edit later.
-    # See https://github.com/jeessy2/ddns-go — config.yaml schema.
-    # User credentials: jackylai / M@x12493417260707 (BCrypt'ed at runtime by ddns-go).
-    cat > "$DDNS_DIR/conf/.ddns_go_config.yaml" <<DDNSCFG
-Ipv4:
-  Enable: true
-  GetType: netInterface
-  IPReg: ""
-  NetInterface: ""
-  Cmd: ""
-  URL: "https://myip4.ipip.net|https://api.ipify.org|https://ip4.seeip.org"
-  Domains:
-    - "$DOMAIN"
-    - "*.$DOMAIN"
-Ipv6:
-  Enable: false
-  GetType: netInterface
-  IPReg: ""
-  NetInterface: ""
-  Cmd: ""
-  URL: "https://api64.ipify.org"
-  Domains: []
-DNS:
-  Name: cloudflare
-  ID: ""
-  Secret: "$CF_TOKEN"
-User:
-  Username: "$PANEL_USERNAME"
-  Password: "$PANEL_PASSWORD"
-Webhook:
-  WebhookURL: ""
-  WebhookRequestBody: ""
-  WebhookHeaders: ""
-TTL: "60"
+    # Seed ddns-go with the real v6+ config schema the container uses on disk.
+    # Password is bcrypt-hashed by htpasswd (installed earlier). The container
+    # will pick the file up on first start and never require web onboarding.
+    # Only create the config if it doesn't already exist — after first run
+    # ddns-go treats its config file as source of truth, and blindly
+    # overwriting it can wipe anything you edited in the UI.
+    if [[ ! -f "$DDNS_DIR/conf/.ddns_go_config.yaml" ]]; then
+        BCRYPT_PW=$(htpasswd -bnBC 10 "" "$PANEL_PASSWORD" 2>/dev/null | tr -d ':\n' | sed 's/^\$2y\$/\$2a\$/')
+        if [[ -z "$BCRYPT_PW" ]]; then
+            # fallback: skip hash and let user set password via UI on first login
+            echo "### warn: htpasswd bcrypt failed; ddns-go will prompt for password on first visit" >&2
+            BCRYPT_PW=""
+        fi
+        cat > "$DDNS_DIR/conf/.ddns_go_config.yaml" <<DDNSCFG
+dnsconf:
+    - name: ""
+      ipv4:
+        enable: true
+        gettype: url
+        url: https://ddns.oray.com/checkip, https://ip.3322.net, https://4.ipw.cn, https://v4.yinghualuo.cn/bejson, https://myip.ipip.net
+        netinterface: eth0
+        cmd: ""
+        domains:
+            - ${DOMAIN}
+            - '*.${DOMAIN}'
+      ipv6:
+        enable: false
+        gettype: netInterface
+        url: https://speed.neu6.edu.cn/getIP.php, https://v6.ident.me, https://6.ipw.cn, https://v6.yinghualuo.cn/bejson
+        netinterface: ""
+        cmd: ""
+        ipv6reg: ""
+        domains:
+            - ""
+      dns:
+        name: cloudflare
+        id: ""
+        secret: ${CF_TOKEN}
+        extparam: ""
+      ttl: ""
+      httpinterface: ""
+user:
+    username: ${PANEL_USERNAME}
+    password: ${BCRYPT_PW}
+webhook:
+    webhookurl: ""
+    webhookrequestbody: ""
+    webhookheaders: ""
+notallowwanaccess: false
+lang: en
 DDNSCFG
-    chmod 600 "$DDNS_DIR/conf/.ddns_go_config.yaml"
+        chmod 600 "$DDNS_DIR/conf/.ddns_go_config.yaml"
+    fi
 
-    (cd "$DDNS_DIR" && docker compose pull && docker compose up -d)
+    (cd "$DDNS_DIR" && docker compose pull && docker compose up -d --force-recreate)
 
     # Reverse-proxy the web UI as ddns.\$DOMAIN via Caddy + create the DNS record.
     # caddy-add handles idempotency; safe to re-run.
