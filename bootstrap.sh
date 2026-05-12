@@ -802,6 +802,12 @@ services:
       - ./conf:/root
     environment:
       TZ: Asia/Shanghai
+    # use public DNS so ip-check URLs resolve reliably on OCI boxes where
+    # the default Docker internal DNS (127.0.0.11) sometimes can't reach
+    # the required recursors
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
 DDNSCOMPOSE
 
     # Seed ddns-go with the real v6+ config schema the container uses on disk.
@@ -823,7 +829,7 @@ dnsconf:
       ipv4:
         enable: true
         gettype: url
-        url: https://ddns.oray.com/checkip, https://ip.3322.net, https://4.ipw.cn, https://v4.yinghualuo.cn/bejson, https://myip.ipip.net
+        url: https://api.ipify.org, https://ipv4.icanhazip.com, https://checkip.amazonaws.com, https://ifconfig.me/ip, https://v4.ident.me
         netinterface: eth0
         cmd: ""
         domains:
