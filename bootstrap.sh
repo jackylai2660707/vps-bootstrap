@@ -222,6 +222,78 @@ fi
 echo "### 1Panel ready"
 
 # ============================================================
+# 5b. Seed 1Panel Terminal's local SSH connection
+#     so "Terminal" tab on the Panel immediately connects to this host.
+# ============================================================
+seed_1panel_terminal_ssh() {
+    # needs: agent.db + sqlite3 + python3+cryptography
+    local db=/opt/1panel/db/agent.db
+    [[ -f "$db" ]] || { echo "!!! $db missing, skipping terminal seed"; return 0; }
+    # wait for agent DB to be initialized with EncryptKey (1panel-core populates
+    # it on first start; retry up to 30s)
+    local key=""
+    for _ in $(seq 1 15); do
+        key=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='EncryptKey'" 2>/dev/null)
+        [[ -n "$key" ]] && break
+        sleep 2
+    done
+    if [[ -z "$key" ]]; then
+        echo "!!! EncryptKey not yet available in $db; skipping terminal seed"
+        return 0
+    fi
+
+    # make sure sqlite3 + cryptography are around
+    command -v sqlite3 >/dev/null 2>&1 || apt-get install -y -qq sqlite3 >/dev/null
+    if ! python3 -c "import cryptography" 2>/dev/null; then
+        apt-get install -y -qq python3-cryptography >/dev/null || \
+            pip3 install --quiet --break-system-packages cryptography >/dev/null 2>&1 || true
+    fi
+
+    python3 - "$key" "$NEW_SSH_PORT" "$ROOT_PASSWORD" "$db" <<'PYEOF'
+import base64, json, os, sqlite3, sys
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.padding import PKCS7
+
+encrypt_key, ssh_port, root_password, db_path = sys.argv[1:5]
+payload = {
+    "addr": "127.0.0.1",
+    "port": int(ssh_port),
+    "user": "root",
+    "authMode": "password",
+    "password": root_password,
+    "privateKey": "",
+    "passPhrase": "",
+}
+pt = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+padder = PKCS7(128).padder()
+padded = padder.update(pt) + padder.finalize()
+
+iv = os.urandom(16)
+cipher = Cipher(algorithms.AES(encrypt_key.encode()), modes.CBC(iv))
+enc = cipher.encryptor()
+ct = enc.update(padded) + enc.finalize()
+
+blob = base64.b64encode(iv + ct).decode()
+
+conn = sqlite3.connect(db_path, timeout=10)
+cur = conn.cursor()
+for k, v in [("LocalSSHConn", blob), ("LocalSSHConnShow", "Enable")]:
+    cur.execute("SELECT COUNT(*) FROM settings WHERE key=?", (k,))
+    if cur.fetchone()[0]:
+        cur.execute("UPDATE settings SET value=?, updated_at=datetime('now') WHERE key=?", (v, k))
+    else:
+        cur.execute(
+            "INSERT INTO settings (key, value, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))",
+            (k, v),
+        )
+conn.commit()
+conn.close()
+print("terminal SSH seeded: 127.0.0.1:" + ssh_port + " root/<password>")
+PYEOF
+}
+seed_1panel_terminal_ssh || echo "!!! terminal seed failed, continuing"
+
+# ============================================================
 # 6. sing-box (hysteria2 + vless-reality)
 # ============================================================
 SB_DIR="/opt/1panel/docker/compose/singbox"
