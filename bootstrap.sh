@@ -298,20 +298,33 @@ seed_1panel_terminal_ssh || echo "!!! terminal seed failed, continuing"
 # ============================================================
 SB_DIR="/opt/1panel/docker/compose/singbox"
 SB_CFG="${SB_DIR}/config"
-mkdir -p "$SB_CFG"
+mkdir -p "$SB_CFG" "$SB_CFG/acme"
 
-# Determine cert paths: if DOMAIN + Caddy certs exist, use real LE cert;
-# otherwise fall back to self-signed (for no-domain deployments).
-CADDY_CERT_DIR="/opt/1panel/docker/compose/caddy/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory"
-if [[ -n "$DOMAIN" && -f "${CADDY_CERT_DIR}/${DOMAIN}/${DOMAIN}.crt" ]]; then
-    # Use Caddy's real LE certificate for hy2 (no allowInsecure needed on client)
-    HY2_CERT_PATH="/certs/${DOMAIN}/${DOMAIN}.crt"
-    HY2_KEY_PATH="/certs/${DOMAIN}/${DOMAIN}.key"
-    HY2_SERVER_NAME="$DOMAIN"
-    SB_CERT_VOLUME="${CADDY_CERT_DIR}:/certs:ro"
-    echo "### sing-box will use Caddy's LE cert for hy2 (sni=$DOMAIN)"
+if [[ -n "$DOMAIN" && -n "$CF_TOKEN" ]]; then
+    # sing-box handles ACME itself via Cloudflare DNS-01 (no Caddy dependency,
+    # no allowInsecure on client).  server_name = $DOMAIN, and the cert is
+    # persisted/renewed under config/acme/.
+    HY2_TLS_BLOCK=$(cat <<TLSBLOCK
+        "enabled": true,
+        "server_name": "${DOMAIN}",
+        "alpn": ["h3"],
+        "acme": {
+          "domain": ["${DOMAIN}"],
+          "data_directory": "/var/lib/sing-box/acme",
+          "email": "acme@${DOMAIN}",
+          "provider": "letsencrypt",
+          "disable_http_challenge": true,
+          "disable_tls_alpn_challenge": true,
+          "dns01_challenge": {
+            "provider": "cloudflare",
+            "api_token": "${CF_TOKEN}"
+          }
+        }
+TLSBLOCK
+)
+    echo "### sing-box hy2 will acquire its own LE cert via Cloudflare DNS-01 (sni=${DOMAIN})"
 else
-    # Self-signed fallback (client needs allowInsecure=true)
+    # No domain/token: fall back to self-signed.  Client must set allowInsecure.
     if [[ ! -f "${SB_CFG}/cert.pem" || ! -f "${SB_CFG}/key.pem" ]]; then
         openssl req -x509 -newkey ec:<(openssl ecparam -name prime256v1) \
             -nodes -days 3650 \
@@ -322,11 +335,15 @@ else
             2>/dev/null
         chmod 644 "${SB_CFG}/cert.pem" "${SB_CFG}/key.pem"
     fi
-    HY2_CERT_PATH="/etc/sing-box/cert.pem"
-    HY2_KEY_PATH="/etc/sing-box/key.pem"
-    HY2_SERVER_NAME="$HY2_CERT_CN"
-    SB_CERT_VOLUME="${SB_CFG}/cert.pem:/etc/sing-box/cert.pem:ro"
-    echo "### sing-box will use self-signed cert for hy2 (sni=$HY2_CERT_CN, allowInsecure needed)"
+    HY2_TLS_BLOCK=$(cat <<TLSBLOCK
+        "enabled": true,
+        "server_name": "${HY2_CERT_CN}",
+        "alpn": ["h3"],
+        "certificate_path": "/etc/sing-box/cert.pem",
+        "key_path": "/etc/sing-box/key.pem"
+TLSBLOCK
+)
+    echo "### sing-box hy2 using self-signed cert (sni=${HY2_CERT_CN}, client allowInsecure)"
 fi
 
 cat > "${SB_CFG}/config.json" <<EOF
@@ -340,11 +357,7 @@ cat > "${SB_CFG}/config.json" <<EOF
       "listen_port": ${HY2_PORT},
       "users": [ { "password": "${HY2_PASSWORD}" } ],
       "tls": {
-        "enabled": true,
-        "server_name": "${HY2_SERVER_NAME}",
-        "alpn": ["h3"],
-        "certificate_path": "${HY2_CERT_PATH}",
-        "key_path": "${HY2_KEY_PATH}"
+${HY2_TLS_BLOCK}
       }
     },
     {
@@ -371,9 +384,9 @@ cat > "${SB_CFG}/config.json" <<EOF
   ]
 }
 EOF
+chmod 600 "${SB_CFG}/config.json"
 
-# docker-compose for sing-box — dynamically set cert volume
-cat > "${SB_DIR}/docker-compose.yml" <<SBCOMPOSE
+cat > "${SB_DIR}/docker-compose.yml" <<'SBCOMPOSE'
 services:
   singbox:
     image: ghcr.io/sagernet/sing-box:latest
@@ -382,27 +395,22 @@ services:
     network_mode: host
     volumes:
       - ./config/config.json:/etc/sing-box/config.json:ro
+      - ./config/acme:/var/lib/sing-box/acme
       - ./config/cert.pem:/etc/sing-box/cert.pem:ro
       - ./config/key.pem:/etc/sing-box/key.pem:ro
-      - ${SB_CERT_VOLUME}
     command: ["run", "-c", "/etc/sing-box/config.json"]
 SBCOMPOSE
 
-# validate config (mount both possible cert sources so check passes)
+# validate config
 docker run --rm \
     -v "${SB_CFG}/config.json:/etc/sing-box/config.json:ro" \
+    -v "${SB_CFG}/acme:/var/lib/sing-box/acme" \
     -v "${SB_CFG}/cert.pem:/etc/sing-box/cert.pem:ro" \
     -v "${SB_CFG}/key.pem:/etc/sing-box/key.pem:ro" \
-    -v "${CADDY_CERT_DIR}:/certs:ro" \
     ghcr.io/sagernet/sing-box:latest check -c /etc/sing-box/config.json
 
 (cd "$SB_DIR" && docker compose pull && docker compose up -d --force-recreate)
 echo "### sing-box running on ${HY2_PORT}/udp + ${VLESS_PORT}/tcp"
-
-# Daily cron to reload sing-box so it picks up renewed certs from Caddy
-CRON_LINE="0 4 * * * docker restart singbox >/dev/null 2>&1"
-(crontab -l 2>/dev/null | grep -v "docker restart singbox"; echo "$CRON_LINE") | crontab -
-echo "### cron: daily singbox restart at 04:00 for cert renewal pickup"
 
 # ============================================================
 # 7. Cloudflare DNS + Caddy reverse proxy (optional, needs DOMAIN + CF_TOKEN)
